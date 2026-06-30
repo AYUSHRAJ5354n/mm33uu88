@@ -3,3 +3,4 @@ tgcrypto
 yt-dlp
 motor
 dnspython
+curl-cffi
