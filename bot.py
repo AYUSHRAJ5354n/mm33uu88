@@ -2,7 +2,6 @@ import os
 import asyncio
 import time
 import re
-from datetime import datetime
 import yt_dlp
 from pyrogram import Client, filters
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -18,126 +17,141 @@ app = Client("m3u8_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 db_client = AsyncIOMotorClient(MONGO_URI)
 db = db_client["recorder_bot"]
 cookies_col = db["cookies"]
-stats_col = db["stats"]
 
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# --- TCP HEALTH CHECK ---
-async def health_check():
+async def start_health_check():
     server = await asyncio.start_server(lambda r, w: w.close(), '0.0.0.0', PORT)
-    async with server:
-        await server.serve_forever()
+    async with server: await server.serve_forever()
 
-# --- HELPERS ---
-async def update_stats():
-    await stats_col.update_one({"id": "bot_stats"}, {"$inc": {"total_downloads": 1}}, upsert=True)
+# --- PARSER FOR AIO SUPPORT ---
+def parse_aio_args(args):
+    """
+    Parses: url [duration] [name] [-aio]
+    Example: https://site.com/s.m3u8 00:01:00 my_show -aio
+    """
+    data = {"url": None, "duration": None, "name": None, "aio": False}
+    if not args: return data
+    
+    # Check for -aio flag
+    if "-aio" in args:
+        data["aio"] = True
+        args = [a for a in args if a != "-aio"]
+    
+    if len(args) >= 1: data["url"] = args[0]
+    if len(args) >= 2: data["duration"] = args[1] # Format: HH:MM:SS
+    if len(args) >= 3: data["name"] = args[2]
+    
+    return data
 
 async def progress(current, total, message, start_time):
     now = time.time()
     diff = now - start_time
-    if round(diff % 4.0) == 0 or current == total:
+    if round(diff % 5.0) == 0 or current == total:
         percentage = current * 100 / total
-        speed = current / diff
+        speed = current / (diff if diff > 0 else 1)
         try:
-            await message.edit(f"📤 **Uploading...**\n`{percentage:.1f}%` | `{speed/1024/1024:.1f} MB/s`")
+            await message.edit(f"📤 **AIO Uploading...**\n`{percentage:.1f}%` | `{speed/1024/1024:.2f} MB/s`")
         except: pass
 
-# --- COMMANDS ---
-@app.on_message(filters.command("start"))
-async def start_cmd(_, m):
-    await m.reply_text("✅ **Bot Fixed & Active**\nIncludes Cloudflare Bypass & 2GB Support.")
-
-@app.on_message(filters.command("addcookie"))
-async def add_cookie(_, m):
-    if not m.reply_to_message or not m.reply_to_message.document:
-        return await m.reply_text("❌ Reply to a cookies .txt file.")
-    tag = m.command[1] if len(m.command) > 1 else "default"
-    path = await m.reply_to_message.download()
-    with open(path, "r") as f: content = f.read()
-    await cookies_col.update_one({"tag": tag}, {"$set": {"content": content}}, upsert=True)
-    os.remove(path)
-    await m.reply_text(f"✅ Cookie saved as `{tag}`")
-
-@app.on_message(filters.command("stats"))
-async def stats_cmd(_, m):
-    data = await stats_col.find_one({"id": "bot_stats"})
-    count = data.get("total_downloads", 0) if data else 0
-    await m.reply_text(f"📊 **Total Videos Processed:** {count}")
-
-async def download_engine(m, url, tag=None):
-    status = await m.reply_text("⚙️ **Bypassing Protections...**")
+# --- DOWNLOAD ENGINE ---
+async def download_engine(m, args, cookie_tag=None):
+    parsed = parse_aio_args(args)
+    if not parsed["url"]:
+        return await m.reply_text("❌ URL missing.")
+    
+    status = await m.reply_text("🚀 **AIO Engine Initializing...**")
     cookie_file = f"temp_{m.id}.txt"
     
-    # ADVANCED OPTIONS TO BYPASS 403/CLOUDFLARE
+    # Custom Name Logic
+    out_name = parsed["name"] if parsed["name"] else "%(title)s"
+    
     ydl_opts = {
         'format': 'bestvideo+bestaudio/best',
-        'outtmpl': f'{DOWNLOAD_DIR}/{m.id}_%(title)s.%(ext)s',
+        'outtmpl': f'{DOWNLOAD_DIR}/{m.id}/{out_name}.%(ext)s',
         'merge_output_format': 'mp4',
         'quiet': True,
-        # Impersonate Chrome to bypass Cloudflare
-        'impersonate': 'chrome', 
+        'impersonate': 'chrome',
         'extractor_args': {'generic': {'impersonate': True}},
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-            'Accept': '*/*',
-            'Connection': 'keep-alive',
-        }
     }
 
-    if tag:
-        data = await cookies_col.find_one({"tag": tag})
+    # If -aio flag or specific sites are used, use aggressive headers
+    if parsed["aio"] or "playyonogames" in parsed["url"]:
+        ydl_opts['http_headers'] = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Referer': 'https://playyonogames.in/',
+            'Origin': 'https://playyonogames.in/',
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
+
+    # Handle Duration (Recording specific length)
+    if parsed["duration"]:
+        # yt-dlp uses --download-sections
+        ydl_opts['download_sections'] = f"*00:00:00-{parsed['duration']}"
+        ydl_opts['force_keyframes_at_cuts'] = True
+
+    if cookie_tag:
+        data = await cookies_col.find_one({"tag": cookie_tag})
         if data:
             with open(cookie_file, "w") as f: f.write(data["content"])
             ydl_opts['cookiefile'] = cookie_file
 
     try:
-        await status.edit("📥 **Downloading/Recording...**\n_This might take a minute for m3u8..._")
+        await status.edit("📥 **Downloading/Recording...**\n_Applying AIO Bypasses_")
         
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Handle the download
-            info = await asyncio.get_event_loop().run_in_executor(None, lambda: ydl.extract_info(url, download=True))
-            f_path = ydl.prepare_filename(info)
-            # Fix path if merged
-            if not os.path.exists(f_path):
-                f_path = f_path.rsplit('.', 1)[0] + ".mp4"
+        loop = asyncio.get_event_loop()
+        def run_ydl():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(parsed["url"], download=True)
+                return ydl.prepare_filename(info)
 
-        await status.edit("📤 **Uploading to Telegram...**")
+        f_path = await loop.run_in_executor(None, run_ydl)
+
+        # File validation
+        if not os.path.exists(f_path):
+            base = os.path.splitext(f_path)[0]
+            for ext in ['.mp4', '.mkv', '.ts']:
+                if os.path.exists(base + ext):
+                    f_path = base + ext
+                    break
+
+        await status.edit("📤 **Recording Done. Uploading (2GB Max)...**")
         start_up = time.time()
         await app.send_document(
             chat_id=m.chat.id,
             document=f_path,
-            caption=f"✅ **Title:** {info.get('title')}",
+            caption=f"✅ **AIO Completed**\n📦 **Name:** `{os.path.basename(f_path)}`",
             progress=progress,
             progress_args=(status, start_up)
         )
-        await update_stats()
-        if os.path.exists(f_path): os.remove(f_path)
+        os.remove(f_path)
         await status.delete()
 
     except Exception as e:
-        error_msg = str(e)
-        if "403" in error_msg:
-            error_msg = "❌ **403 Forbidden**: Site blocked the bot. Try adding/updating Cookies."
-        elif "m3u8" in error_msg:
-            error_msg = "❌ **m3u8 Error**: Link is invalid or expired."
-        await status.edit(f"❌ **Error:** `{error_msg}`")
+        await status.edit(f"❌ **AIO Error:**\n`{str(e)[:500]}`")
     finally:
         if os.path.exists(cookie_file): os.remove(cookie_file)
 
+# --- HANDLERS ---
 @app.on_message(filters.command("rec"))
 async def rec_handler(_, m):
-    if len(m.command) < 2: return
-    await download_engine(m, m.command[1])
+    await download_engine(m, m.command[1:])
 
 @app.on_message(filters.command("ddl"))
 async def ddl_handler(_, m):
+    # For DDL, the last arg is usually the cookie tag
     if len(m.command) < 3: return
-    await download_engine(m, m.command[1], m.command[2])
+    tag = m.command[-1]
+    args = m.command[1:-1]
+    await download_engine(m, args, tag)
 
-# --- BOOT ---
+@app.on_message(filters.command("start"))
+async def start_cmd(_, m):
+    await m.reply_text("🤖 **AIO m3u8 Recorder Online**\nUsage:\n`/rec [URL] [Duration] [Name] -aio`")
+
 async def main():
-    await asyncio.gather(health_check(), app.start())
+    await asyncio.gather(start_health_check(), app.start())
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
